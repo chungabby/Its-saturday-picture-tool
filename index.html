@@ -61,7 +61,6 @@
   .cb-title .spark { font-size: 24px; line-height: 1.2; }
   .cb-title-text span { display: block; font-size: 13px; font-weight: 500; color: var(--ink-soft); margin-top: 8px; letter-spacing: 0; line-height: 1.6; }
 
-  /* target size selector — pastel gradient cards */
   .cb-target-row { display: flex; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
   .cb-target-card {
     flex: 1;
@@ -88,7 +87,6 @@
   .cb-target-card[data-kb="150"].active { background: linear-gradient(155deg, var(--lav-1), var(--lav-2)); color: #362a52; }
   .cb-target-card[data-kb="200"].active { background: linear-gradient(155deg, var(--sage-1), var(--sage-2)); color: #2c3e22; }
 
-  /* dropzone */
   .cb-dropzone {
     border-radius: 24px;
     padding: 34px 24px;
@@ -123,9 +121,7 @@
   .cb-btn.primary { background: linear-gradient(155deg, var(--mint-1), var(--mint-2)); color: #1d3a2a; }
   .cb-btn.ghost { background: transparent; color: var(--ink-soft); box-shadow: none; border: 1.5px solid #ddd8cf; }
 
-  .cb-summary {
-    display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap;
-  }
+  .cb-summary { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
   .cb-summary .chip {
     background: var(--pill);
     border-radius: 999px;
@@ -136,7 +132,6 @@
   }
   .cb-summary .chip b { color: var(--ink); }
 
-  /* list */
   .cb-list { display: flex; flex-direction: column; gap: 12px; }
   .cb-item {
     display: grid;
@@ -265,7 +260,7 @@
   const targetBtns = root.querySelectorAll('.cb-target-card');
 
   let targetKB = 150;
-  let items = []; // {file, id, originalSize, status, compressedBlob, compressedSize, thumbUrl}
+  let items = []; 
 
   targetBtns.forEach(btn => {
     btn.addEventListener('click', () => {
@@ -305,20 +300,25 @@
   }
 
   function render() {
-    listEl.innerHTML = items.map(it => `
-      <div class="cb-item" id="row-${it.id}">
-        <div class="cb-thumb-wrap"><img class="cb-thumb" src="${it.thumbUrl}" /></div>
-        <div class="cb-name" title="${escapeHtml(it.file.name)}">${escapeHtml(it.file.name)}</div>
-        <div class="cb-size">
-          ${fmtKB(it.originalSize)}
-          ${it.compressedBlob ? `<span class="arrow">→</span><span class="after">${fmtKB(it.compressedSize)}</span>` : ''}
+    listEl.innerHTML = items.map(it => {
+      const dlName = downloadName(it.file.name, it.compressedBlob ? it.compressedBlob.type : '');
+      const blobUrl = it.compressedBlob ? URL.createObjectURL(it.compressedBlob) : '';
+      
+      return `
+        <div class="cb-item" id="row-${it.id}">
+          <div class="cb-thumb-wrap"><img class="cb-thumb" src="${it.thumbUrl}" /></div>
+          <div class="cb-name" title="${escapeHtml(it.file.name)}">${escapeHtml(it.file.name)}</div>
+          <div class="cb-size">
+            ${fmtKB(it.originalSize)}
+            ${it.compressedBlob ? `<span class="arrow">→</span><span class="after">${fmtKB(it.compressedSize)}</span>` : ''}
+          </div>
+          <div class="cb-status-pill ${statusClass(it.status)}">${statusLabel(it.status)}</div>
+          ${it.compressedBlob
+            ? `<a class="cb-dl ready" href="${blobUrl}" download="${escapeHtml(dlName)}" title="下載">↓</a>`
+            : `<span class="cb-dl">·</span>`}
         </div>
-        <div class="cb-status-pill ${statusClass(it.status)}">${statusLabel(it.status)}</div>
-        ${it.compressedBlob
-          ? `<a class="cb-dl ready" href="${URL.createObjectURL(it.compressedBlob)}" download="${downloadName(it.file.name)}" title="下載">↓</a>`
-          : `<span class="cb-dl">·</span>`}
-      </div>
-    `).join('');
+      `;
+    }).join('');
   }
 
   function statusClass(s) {
@@ -333,11 +333,19 @@
     if (s === 'done') return '完成';
     return '失敗';
   }
-  function downloadName(name) {
+
+  // 核心修改點：依據輸出的 Blob MIME type 動態轉成對應副檔名，並保持原始主檔名不變
+  function downloadName(name, mimeType) {
     const dot = name.lastIndexOf('.');
     const base = dot > -1 ? name.slice(0, dot) : name;
-    return base + '_' + targetKB + 'kb.jpg';
+    
+    let ext = '.jpg';
+    if (mimeType === 'image/png') ext = '.png';
+    else if (mimeType === 'image/webp') ext = '.webp';
+
+    return base + ext;
   }
+
   function escapeHtml(s) {
     return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
@@ -401,7 +409,10 @@
     zipBtn.textContent = '打包中…';
     try {
       const zip = new JSZip();
-      done.forEach(it => zip.file(downloadName(it.file.name), it.compressedBlob));
+      done.forEach(it => {
+        const name = downloadName(it.file.name, it.compressedBlob.type);
+        zip.file(name, it.compressedBlob);
+      });
       const blob = await zip.generateAsync({ type: 'blob' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -417,7 +428,6 @@
     }
   });
 
-  // ---- Core compression: quality-first binary search, resize only as last resort ----
   function loadImage(file) {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -445,11 +455,10 @@
       canvas.width = w;
       canvas.height = h;
       const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#fff'; // flatten transparency onto white
+      ctx.fillStyle = '#fff';
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(img, 0, 0, w, h);
 
-      // Binary search quality for this scale
       let lo = 0.05, hi = 0.97;
       let found = null;
       for (let i = 0; i < 8; i++) {
@@ -457,12 +466,11 @@
         const blob = await canvasToBlob(canvas, mid);
         if (blob.size <= targetBytes) {
           found = blob;
-          lo = mid; // try to push quality higher
+          lo = mid;
         } else {
           hi = mid;
         }
       }
-      // also test the top of the range in case it already fits
       const highBlob = await canvasToBlob(canvas, hi);
       if (highBlob.size <= targetBytes && (!found || highBlob.size > found.size)) {
         found = highBlob;
@@ -470,15 +478,13 @@
 
       if (found) {
         bestBlob = found;
-        break; // success at this scale, keep max resolution achieved
+        break;
       }
 
-      // Even lowest quality too big -> shrink dimensions and retry
       scale *= 0.75;
     }
 
     if (!bestBlob) {
-      // Fallback: return smallest achievable at final scale/quality
       const w = Math.max(1, Math.round(img.naturalWidth * scale));
       const h = Math.max(1, Math.round(img.naturalHeight * scale));
       const canvas = document.createElement('canvas');
