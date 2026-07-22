@@ -64,7 +64,7 @@
   .cb-target-row { display: flex; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
   .cb-target-card {
     flex: 1;
-    min-width: 130px;
+    min-width: 180px;
     border: none;
     cursor: pointer;
     border-radius: 20px;
@@ -79,6 +79,7 @@
   .cb-target-card:hover { transform: translateY(-2px); }
   .cb-target-card .kb { font-size: 22px; font-weight: 700; display: block; }
   .cb-target-card .lbl { font-size: 11.5px; margin-top: 2px; display: block; opacity: 0.85; }
+  .cb-target-card .desc { font-size: 11px; margin-top: 8px; display: block; opacity: 0.8; line-height: 1.4; }
   .cb-target-card.active {
     color: #fff;
     box-shadow: 0 8px 20px rgba(0,0,0,0.12);
@@ -212,9 +213,21 @@
   </div>
 
   <div class="cb-target-row" id="cb-targets">
-    <button class="cb-target-card" data-kb="100"><span class="kb">100 KB</span><span class="lbl">精簡</span></button>
-    <button class="cb-target-card active" data-kb="150"><span class="kb">150 KB</span><span class="lbl">均衡</span></button>
-    <button class="cb-target-card" data-kb="200"><span class="kb">200 KB</span><span class="lbl">畫質優先</span></button>
+    <button class="cb-target-card" data-kb="100">
+      <span class="kb">100 KB</span>
+      <span class="lbl">精簡</span>
+      <span class="desc">適合用在 👉 商品頁面下面的圖片敘述區</span>
+    </button>
+    <button class="cb-target-card active" data-kb="150">
+      <span class="kb">150 KB</span>
+      <span class="lbl">均衡</span>
+      <span class="desc">適合用在 👉 商品輪播圖</span>
+    </button>
+    <button class="cb-target-card" data-kb="200">
+      <span class="kb">200 KB</span>
+      <span class="lbl">畫質優先</span>
+      <span class="desc">適合用在 👉 網站上的大 banner</span>
+    </button>
   </div>
 
   <div class="cb-dropzone" id="cb-drop">
@@ -334,7 +347,6 @@
     return '失敗';
   }
 
-  // 核心修改點：依據輸出的 Blob MIME type 動態轉成對應副檔名，並保持原始主檔名不變
   function downloadName(name, mimeType) {
     const dot = name.lastIndexOf('.');
     const base = dot > -1 ? name.slice(0, dot) : name;
