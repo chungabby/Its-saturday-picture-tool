@@ -293,14 +293,37 @@
   const summaryEl = root.querySelector('#cb-summary');
   const targetBtns = root.querySelectorAll('.cb-target-card');
 
+  // ===== 可調整參數 =====
+  const MAX_DIM = 2560;          // 目標容量模式：最長邊上限（網頁用圖不需要 4000px+）
+  const MIN_Q = 0.4;             // 品質低於此值會很糊，改用縮小尺寸來達成容量
+  const MAX_PIXELS = 16000000;   // iOS Safari canvas 面積上限約 16.7MP，超過 toBlob 會失敗
+  const THUMB = 104;             // 縮圖邊長（顯示 52px，2 倍給 Retina）
+
   let currentTarget = '150'; // '100', '150', '200', 'original'
   let items = [];
+  let session = 0;           // 每次「清空」就 +1，讓進行中的舊工作自動停止
+  let running = false;
+  let nativeHeic = null;     // 瀏覽器是否能原生解 HEIC（Safari 可以），null = 尚未測試
+  let heicQueue = Promise.resolve();
+  let thumbQueue = Promise.resolve();
 
   targetBtns.forEach(btn => {
     btn.addEventListener('click', () => {
+      if (running) return; // 處理中不允許切換，避免同一批結果混用不同設定
       targetBtns.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
+      if (currentTarget === btn.dataset.kb) return;
       currentTarget = btn.dataset.kb;
+      // 換了目標大小 → 已完成的圖片改回「等待處理」，可直接用新設定重跑
+      items.forEach(it => {
+        if (it.status === 'done') {
+          resetResult(it);
+          it.status = 'wait';
+          updateRow(it);
+        }
+      });
+      summaryEl.style.display = 'none';
+      updateButtons();
     });
   });
 
@@ -321,79 +344,165 @@
     return name.endsWith('.heic') || name.endsWith('.heif') || file.type === 'image/heic' || file.type === 'image/heif';
   }
 
-  async function handleFiles(fileList) {
-    const rawFiles = Array.from(fileList);
-    for (const file of rawFiles) {
+  // ---------- 加入檔案 ----------
+  function handleFiles(fileList) {
+    const s = session;
+    const added = [];
+    for (const file of Array.from(fileList)) {
       const isHeic = isHeicFile(file);
       const isImg = file.type.startsWith('image/') || isHeic;
       if (!isImg) continue;
 
-      const id = 'f' + Math.random().toString(36).slice(2, 10);
       const item = {
         file,
-        id,
+        id: 'f' + Math.random().toString(36).slice(2, 10),
         isHeic,
         originalSize: file.size,
         status: isHeic ? 'heic_decoding' : 'wait',
-        sourceBlob: null,
+        sourceBlob: isHeic ? null : file,
         compressedBlob: null,
         compressedSize: 0,
-        thumbUrl: ''
+        dlUrl: '',
+        dlName: downloadName(file.name),
+        thumbUrl: '',
+        row: null
       };
-
       items.push(item);
-      render();
-      updateButtons();
-
-      if (isHeic) {
-        // HEIC 檔案進行解碼轉成 JPG Blob
-        try {
-          const converted = await heic2any({
-            blob: file,
-            toType: 'image/jpeg',
-            quality: 0.95
-          });
-          const convertedBlob = Array.isArray(converted) ? converted[0] : converted;
-          item.sourceBlob = convertedBlob;
-          item.thumbUrl = URL.createObjectURL(convertedBlob);
-          item.status = 'wait';
-        } catch (err) {
-          console.error('HEIC 轉碼失敗:', err);
-          item.status = 'error';
-        }
-      } else {
-        item.sourceBlob = file;
-        item.thumbUrl = URL.createObjectURL(file);
-      }
-      render();
-      updateButtons();
+      addRow(item);
+      added.push(item);
     }
+    input.value = ''; // 讓同一批檔案可以再選一次
+    updateButtons();
+
+    // 先把所有列顯示出來，再逐張排隊解碼（一次解多張大圖會吃光記憶體）
+    added.forEach(it => {
+      if (it.isHeic) heicQueue = heicQueue.then(() => decodeHeic(it, s));
+      else thumbQueue = thumbQueue.then(() => buildThumb(it, it.file, s));
+    });
   }
 
-  function render() {
-    listEl.innerHTML = items.map(it => {
-      const dlName = downloadName(it.file.name);
-      const blobUrl = it.compressedBlob ? URL.createObjectURL(it.compressedBlob) : '';
-      
-      return `
-        <div class="cb-item" id="row-${it.id}">
-          <div class="cb-thumb-wrap">
-            ${it.thumbUrl ? `<img class="cb-thumb" src="${it.thumbUrl}" />` : '轉檔中…'}
-          </div>
-          <div class="cb-name" title="${escapeHtml(it.file.name)}">
-            ${it.isHeic ? '<span class="cb-tag-heic">HEIC</span>' : ''}${escapeHtml(it.file.name)}
-          </div>
-          <div class="cb-size">
-            ${fmtKB(it.originalSize)}
-            ${it.compressedBlob ? `<span class="arrow">→</span><span class="after">${fmtKB(it.compressedSize)}</span>` : ''}
-          </div>
-          <div class="cb-status-pill ${statusClass(it.status)}">${statusLabel(it.status)}</div>
-          ${it.compressedBlob
-            ? `<a class="cb-dl ready" href="${blobUrl}" download="${escapeHtml(dlName)}" title="下載 JPG">↓</a>`
-            : `<span class="cb-dl">·</span>`}
-        </div>
-      `;
-    }).join('');
+  async function decodeHeic(it, s) {
+    if (s !== session) return;
+    try {
+      let img = null;
+      // Safari 可原生解 HEIC：直接用原檔，省掉 heic2any 的解碼＋一次 JPG 重壓
+      if (nativeHeic !== false) {
+        try {
+          img = await loadImage(it.file);
+          it.sourceBlob = it.file;
+          nativeHeic = true;
+        } catch (_) {
+          nativeHeic = false;
+        }
+      }
+      if (!img) {
+        const converted = await heic2any({ blob: it.file, toType: 'image/jpeg', quality: 0.95 });
+        it.sourceBlob = Array.isArray(converted) ? converted[0] : converted;
+        if (s !== session) return;
+        img = await loadImage(it.sourceBlob);
+      }
+      if (s !== session) return;
+      it.thumbUrl = await makeThumb(img);
+      if (s !== session) { URL.revokeObjectURL(it.thumbUrl); return; }
+      it.status = 'wait';
+    } catch (err) {
+      console.error('HEIC 轉碼失敗:', err);
+      if (s !== session) return;
+      it.status = 'error';
+    }
+    updateRow(it);
+    updateButtons();
+  }
+
+  async function buildThumb(it, blob, s) {
+    if (s !== session) return;
+    try {
+      const img = await loadImage(blob);
+      if (s !== session) return;
+      it.thumbUrl = await makeThumb(img);
+      if (s !== session) { URL.revokeObjectURL(it.thumbUrl); return; }
+    } catch (err) {
+      console.error(err);
+      if (s !== session) return;
+      if (it.status === 'wait') it.status = 'error'; // 讀不了的檔案就不要讓它進入處理
+      updateButtons();
+    }
+    updateRow(it);
+  }
+
+  // 產生小縮圖：列表只顯示 52px，不要塞 1200 萬畫素的原圖進去
+  async function makeThumb(img) {
+    const c = document.createElement('canvas');
+    c.width = THUMB; c.height = THUMB;
+    const ctx = c.getContext('2d');
+    ctx.imageSmoothingQuality = 'high';
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const side = Math.min(W, H);
+    ctx.drawImage(img, (W - side) / 2, (H - side) / 2, side, side, 0, 0, THUMB, THUMB);
+    const blob = await canvasToBlob(c, 0.8);
+    freeCanvas(c);
+    return URL.createObjectURL(blob);
+  }
+
+  // ---------- 列表顯示（逐列更新，不再整個重繪） ----------
+  function addRow(it) {
+    const row = document.createElement('div');
+    row.className = 'cb-item';
+    row.id = 'row-' + it.id;
+    row.innerHTML = `
+      <div class="cb-thumb-wrap"></div>
+      <div class="cb-name" title="${escapeHtml(it.file.name)}">
+        ${it.isHeic ? '<span class="cb-tag-heic">HEIC</span>' : ''}${escapeHtml(it.file.name)}
+      </div>
+      <div class="cb-size"></div>
+      <div class="cb-status-pill"></div>
+      <span class="cb-dl">·</span>`;
+    it.row = row;
+    listEl.appendChild(row);
+    updateRow(it);
+  }
+
+  function updateRow(it) {
+    const r = it.row;
+    if (!r) return;
+    const [thumbWrap, , sizeEl, pill, oldDl] = r.children;
+
+    if (it.thumbUrl) {
+      const cur = thumbWrap.querySelector('img');
+      if (!cur || cur.getAttribute('src') !== it.thumbUrl) {
+        thumbWrap.innerHTML = `<img class="cb-thumb" src="${it.thumbUrl}" alt="" />`;
+      }
+    } else {
+      thumbWrap.textContent = it.status === 'error' ? '無法預覽' : (it.isHeic ? '轉檔中…' : '讀取中…');
+    }
+
+    sizeEl.innerHTML = fmtKB(it.originalSize) +
+      (it.compressedBlob ? `<span class="arrow">→</span><span class="after">${fmtKB(it.compressedSize)}</span>` : '');
+
+    pill.className = 'cb-status-pill ' + statusClass(it.status);
+    pill.textContent = statusLabel(it.status);
+
+    let dl;
+    if (it.dlUrl) {
+      dl = document.createElement('a');
+      dl.className = 'cb-dl ready';
+      dl.href = it.dlUrl;
+      dl.download = it.dlName;
+      dl.title = '下載 JPG';
+      dl.textContent = '↓';
+    } else {
+      dl = document.createElement('span');
+      dl.className = 'cb-dl';
+      dl.textContent = '·';
+    }
+    oldDl.replaceWith(dl);
+  }
+
+  function resetResult(it) {
+    if (it.dlUrl) URL.revokeObjectURL(it.dlUrl);
+    it.dlUrl = '';
+    it.compressedBlob = null;
+    it.compressedSize = 0;
   }
 
   function statusClass(s) {
@@ -424,52 +533,66 @@
 
   function updateButtons() {
     const hasWaiting = items.some(i => i.status === 'wait');
-    const hasBusy = items.some(i => i.status === 'heic_decoding' || i.status === 'working');
-    runBtn.disabled = !hasWaiting || hasBusy;
+    const hasDecoding = items.some(i => i.status === 'heic_decoding');
+    runBtn.disabled = running || !hasWaiting || hasDecoding;
     clearBtn.disabled = items.length === 0;
-    const doneCount = items.filter(i => i.status === 'done').length;
-    zipBtn.disabled = doneCount === 0;
+    zipBtn.disabled = !items.some(i => i.status === 'done');
   }
 
   clearBtn.addEventListener('click', () => {
+    session++; // 讓排隊中與處理中的舊工作自行停止
     items.forEach(it => {
       if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl);
+      if (it.dlUrl) URL.revokeObjectURL(it.dlUrl);
     });
     items = [];
+    running = false;
+    heicQueue = Promise.resolve();
+    thumbQueue = Promise.resolve();
     input.value = '';
-    render();
+    listEl.innerHTML = '';
     updateButtons();
     summaryEl.style.display = 'none';
   });
 
+  // ---------- 開始處理 ----------
   runBtn.addEventListener('click', async () => {
-    runBtn.disabled = true;
-    for (const it of items) {
+    if (running) return;
+    running = true;
+    const s = session;
+    const target = currentTarget;
+    updateButtons();
+
+    for (const it of items.slice()) {
+      if (s !== session) break;
       if (it.status !== 'wait') continue;
       it.status = 'working';
-      render();
+      updateRow(it);
       try {
-        let resultBlob;
-        if (currentTarget === 'original') {
-          resultBlob = await convertToJpgOriginal(it.sourceBlob);
-        } else {
-          const targetBytes = parseInt(currentTarget, 10) * 1024;
-          const result = await compressToTarget(it.sourceBlob, targetBytes);
-          resultBlob = result.blob;
-        }
-
-        it.compressedBlob = resultBlob;
-        it.compressedSize = resultBlob.size;
+        const blob = target === 'original'
+          ? await convertToJpgOriginal(it.sourceBlob)
+          : await compressToTarget(it.sourceBlob, parseInt(target, 10) * 1024);
+        if (s !== session) break;
+        resetResult(it);
+        it.compressedBlob = blob;
+        it.compressedSize = blob.size;
+        it.dlUrl = URL.createObjectURL(blob);
         it.status = 'done';
       } catch (err) {
         console.error(err);
+        if (s !== session) break;
         it.status = 'error';
       }
-      render();
+      updateRow(it);
       updateButtons();
+      await new Promise(r => setTimeout(r, 0)); // 讓畫面有機會更新，不會整個卡住
     }
-    runBtn.disabled = false;
-    showSummary();
+
+    if (s === session) {
+      running = false;
+      updateButtons();
+      showSummary();
+    }
   });
 
   function showSummary() {
@@ -486,6 +609,17 @@
     `;
   }
 
+  // ---------- ZIP ----------
+  function uniqueName(name, used) {
+    const dot = name.lastIndexOf('.');
+    let n = name, i = 1;
+    while (used.has(n.toLowerCase())) {
+      n = name.slice(0, dot) + '_' + (i++) + name.slice(dot);
+    }
+    used.add(n.toLowerCase());
+    return n;
+  }
+
   zipBtn.addEventListener('click', async () => {
     const done = items.filter(i => i.status === 'done');
     if (done.length === 0) return;
@@ -493,25 +627,25 @@
     zipBtn.textContent = '打包中…';
     try {
       const zip = new JSZip();
-      done.forEach(it => {
-        const name = downloadName(it.file.name);
-        zip.file(name, it.compressedBlob);
-      });
-      const blob = await zip.generateAsync({ type: 'blob' });
+      const used = new Set();
+      // 同名檔（例如 IMG_0001.HEIC 和 IMG_0001.PNG）不會互相覆蓋
+      done.forEach(it => zip.file(uniqueName(it.dlName, used), it.compressedBlob));
+      const blob = await zip.generateAsync({ type: 'blob' }); // JPG 本身已壓縮，用預設 STORE 最快
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `converted_${currentTarget}kb.zip`;
+      a.download = currentTarget === 'original' ? 'converted_original.zip' : `converted_${currentTarget}kb.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 4000);
     } finally {
-      zipBtn.disabled = false;
       zipBtn.textContent = '全部下載 (.zip)';
+      updateButtons();
     }
   });
 
+  // ---------- 影像處理 ----------
   function loadImage(blob) {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -529,77 +663,91 @@
   }
 
   function canvasToBlob(canvas, quality) {
-    return new Promise(resolve => {
-      canvas.toBlob(blob => resolve(blob), 'image/jpeg', quality);
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(blob => {
+        if (blob) resolve(blob);
+        else reject(new Error('輸出失敗（圖片可能超過瀏覽器 canvas 上限）'));
+      }, 'image/jpeg', quality);
     });
   }
 
+  function drawToCanvas(img, w, h) {
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas;
+  }
+
+  // 用完立刻釋放 canvas 記憶體（iOS 特別重要，不釋放會越跑越慢甚至閃退）
+  function freeCanvas(c) { c.width = 0; c.height = 0; }
+
   async function convertToJpgOriginal(blob) {
     const img = await loadImage(blob);
-    const canvas = document.createElement('canvas');
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0);
-    return await canvasToBlob(canvas, 0.92);
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const scale = Math.min(1, Math.sqrt(MAX_PIXELS / (W * H))); // 48MP 照片才會被縮
+    const canvas = drawToCanvas(img, Math.round(W * scale), Math.round(H * scale));
+    try {
+      return await canvasToBlob(canvas, 0.92);
+    } finally {
+      freeCanvas(canvas);
+    }
   }
 
   async function compressToTarget(blob, targetBytes) {
     const img = await loadImage(blob);
-    let scale = 1;
-    let bestBlob = null;
+    const W = img.naturalWidth, H = img.naturalHeight;
+    // 先把尺寸限制在網頁合理範圍，避免對 1200 萬畫素原圖反覆編碼
+    let scale = Math.min(1, MAX_DIM / Math.max(W, H));
 
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const w = Math.max(1, Math.round(img.naturalWidth * scale));
-      const h = Math.max(1, Math.round(img.naturalHeight * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(img, 0, 0, w, h);
-
-      let lo = 0.05, hi = 0.97;
-      let found = null;
-      for (let i = 0; i < 8; i++) {
-        const mid = (lo + hi) / 2;
-        const b = await canvasToBlob(canvas, mid);
-        if (b.size <= targetBytes) {
-          found = b;
-          lo = mid;
-        } else {
-          hi = mid;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const w = Math.max(1, Math.round(W * scale));
+      const h = Math.max(1, Math.round(H * scale));
+      const canvas = drawToCanvas(img, w, h);
+      try {
+        // 1) 先試最低可接受品質：還是太大就直接依比例縮小，不浪費時間二分搜尋
+        const low = await canvasToBlob(canvas, MIN_Q);
+        if (low.size > targetBytes) {
+          scale *= Math.min(0.9, Math.sqrt(targetBytes / low.size) * 0.95);
+          continue;
         }
-      }
-      const highBlob = await canvasToBlob(canvas, hi);
-      if (highBlob.size <= targetBytes && (!found || highBlob.size > found.size)) {
-        found = highBlob;
-      }
+        // 2) 最高品質就放得下 → 直接用
+        const high = await canvasToBlob(canvas, 0.95);
+        if (high.size <= targetBytes) return high;
 
-      if (found) {
-        bestBlob = found;
-        break;
+        // 3) 二分搜尋品質，達到目標的 90% 以上就提早結束
+        let lo = MIN_Q, hi = 0.95, best = low;
+        for (let i = 0; i < 6; i++) {
+          const mid = (lo + hi) / 2;
+          const b = await canvasToBlob(canvas, mid);
+          if (b.size <= targetBytes) {
+            best = b;
+            lo = mid;
+            if (b.size >= targetBytes * 0.9) break;
+          } else {
+            hi = mid;
+          }
+        }
+        return best;
+      } finally {
+        freeCanvas(canvas);
       }
-
-      scale *= 0.75;
     }
 
-    if (!bestBlob) {
-      const w = Math.max(1, Math.round(img.naturalWidth * scale));
-      const h = Math.max(1, Math.round(img.naturalHeight * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(img, 0, 0, w, h);
-      bestBlob = await canvasToBlob(canvas, 0.05);
+    // 極端情況的保底
+    const w = Math.max(1, Math.round(W * scale));
+    const h = Math.max(1, Math.round(H * scale));
+    const canvas = drawToCanvas(img, w, h);
+    try {
+      return await canvasToBlob(canvas, 0.3);
+    } finally {
+      freeCanvas(canvas);
     }
-
-    return { blob: bestBlob };
   }
 })();
 </script>
